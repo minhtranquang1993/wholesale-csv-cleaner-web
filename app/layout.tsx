@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Wholesale CSV Cleaner",
-  description: "Tool làm sạch dữ liệu Wholesale CSV online",
+  title: "Data Cleaner",
+  description: "Tool làm sạch & pivot dữ liệu CSV / Excel online",
 };
 
 export default function RootLayout({
