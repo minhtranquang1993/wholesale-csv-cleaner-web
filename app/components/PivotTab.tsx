@@ -1,8 +1,7 @@
 "use client";
 
 import { useState, useCallback, useRef } from "react";
-
-type PivotMode = "patient" | "source";
+import { parseFile, runPivot, type PivotMode } from "../lib/pivot";
 
 interface PivotResult {
   unique_patients: number;
@@ -63,28 +62,20 @@ export default function PivotTab() {
     setDownloadUrl(null);
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("mode", mode);
-
-      const res = await fetch("/api/pivot", {
-        method: "POST",
-        body: formData,
+      // Xử lý ngay trên trình duyệt: không upload file lên server nên
+      // không dính giới hạn body 4.5MB của Vercel, và dữ liệu bệnh nhân
+      // không rời khỏi máy người dùng.
+      const table = await parseFile(file.name, {
+        text: () => file.text(),
+        arrayBuffer: () => file.arrayBuffer(),
       });
+      const { buffer, stats } = await runPivot(table, mode);
 
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Lỗi xử lý file");
-      }
-
-      const statsHeader = res.headers.get("X-Pivot-Stats");
-      if (statsHeader) {
-        setResult(JSON.parse(statsHeader));
-      }
-
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      setDownloadUrl(url);
+      setResult(stats);
+      const blob = new Blob([buffer], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      setDownloadUrl(URL.createObjectURL(blob));
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Đã xảy ra lỗi");
     } finally {
