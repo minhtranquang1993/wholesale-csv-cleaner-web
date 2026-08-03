@@ -32,7 +32,10 @@ export default function WholesaleTab() {
   const handleFile = (f: File) => {
     // Đang xử lý thì không cho đổi file: cleanWholesaleCsv đã giữ file cũ nên
     // đổi tên hiển thị sẽ khiến kết quả không khớp file người dùng thấy.
-    if (busyRef.current) return;
+    if (busyRef.current) {
+      setError("Đang xử lý, vui lòng đợi xong rồi chọn file khác");
+      return;
+    }
     if (!f.name.toLowerCase().endsWith(".csv")) {
       setError("Chỉ hỗ trợ file .csv");
       return;
@@ -129,7 +132,7 @@ export default function WholesaleTab() {
             }}
             onDragLeave={() => setDragOver(false)}
             onDrop={onDrop}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => !loading && fileInputRef.current?.click()}
           >
             <svg
               className="w-12 h-12 text-gray-400 mx-auto mb-3"

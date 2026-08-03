@@ -99,7 +99,10 @@ export default function PivotTab() {
     // Không cho 2 lượt đọc chạy song song: lượt xong trước sẽ set reading=false
     // giữa lúc lượt kia còn đang thêm file, khiến nút chạy pivot mở ra sớm và
     // pivot thiếu file (mất trọn số tiền của file đó).
-    if (busyRef.current) return;
+    if (busyRef.current) {
+      setError("Đang xử lý, vui lòng đợi xong rồi thêm file");
+      return;
+    }
 
     const accepted = incoming.filter((f) => {
       const n = f.name.toLowerCase();
