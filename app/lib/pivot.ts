@@ -99,53 +99,210 @@ export function isEmptyVal(value: unknown): boolean {
 export interface ParsedTable {
   columns: string[];
   rows: Record<string, unknown>[];
+  /** Cột bị bỏ vì trùng normKey với một cột trước đó (giữ cột đầu tiên). */
+  droppedColumns?: string[];
 }
 
-export async function readXlsx(buffer: ArrayBuffer): Promise<ParsedTable> {
+/** Ma trận thô: index 0 = dòng 1 trong Excel. Dòng rỗng được giữ để index luôn khớp. */
+export type RawMatrix = unknown[][];
+
+/** Số dòng đầu file được quét để tìm dòng header. */
+export const HEADER_SCAN_ROWS = 30;
+
+/** Gỡ các dạng cell của exceljs (formula / hyperlink / rich text) về giá trị thô. */
+function unwrapCell(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object") return value;
+  if (value instanceof Date) return value;
+  const o = value as {
+    result?: unknown;
+    richText?: { text?: string }[];
+    text?: unknown;
+    hyperlink?: unknown;
+  };
+  if ("result" in o) return unwrapCell(o.result);
+  if (Array.isArray(o.richText)) {
+    return o.richText.map((part) => part?.text ?? "").join("");
+  }
+  if ("text" in o) return o.text;
+  return null;
+}
+
+/** Nhường main thread để React repaint được progress bar. */
+export function yieldToPaint(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+const YIELD_EVERY_ROWS = 500;
+
+export async function readRawXlsx(
+  buffer: ArrayBuffer,
+  onProgress?: (ratio: number) => void
+): Promise<RawMatrix> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   const ws = wb.worksheets[0];
-  if (!ws) return { columns: [], rows: [] };
+  if (!ws) return [];
 
-  const headerRow = ws.getRow(1);
-  const colNames: { col: number; name: string }[] = [];
-  headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
-    const name = String(cell.value ?? "").trim();
-    if (name) colNames.push({ col: colNumber, name });
+  const width = ws.columnCount;
+  const total = ws.rowCount;
+  const matrix: RawMatrix = [];
+  // Dùng eachCell (bỏ ô rỗng) thay vì getCell: getCell materialize cả ô trống nên
+  // chậm ~42x trên file thật (5408ms vs 127ms) mà ma trận thu được y hệt.
+  // Duyệt tới rowCount (không phải actualRowCount) để index tuyệt đối luôn khớp
+  // số dòng người dùng thấy trong Excel khi họ nhập dòng header thủ công.
+  for (let r = 1; r <= total; r++) {
+    const arr: unknown[] = new Array(width).fill(null);
+    ws.getRow(r).eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      if (colNumber <= width) arr[colNumber - 1] = unwrapCell(cell.value);
+    });
+    matrix.push(arr);
+    if (onProgress && r % YIELD_EVERY_ROWS === 0) {
+      onProgress(r / total);
+      await yieldToPaint();
+    }
+  }
+  onProgress?.(1);
+  return matrix;
+}
+
+export function readRawCsv(text: string): RawMatrix {
+  // header:false + skipEmptyLines:false để index dòng khớp tuyệt đối với file gốc.
+  const parsed = Papa.parse<unknown[]>(text, {
+    header: false,
+    skipEmptyLines: false,
   });
-  const columns = colNames.map((c) => c.name);
+  return (parsed.data as unknown[][]) || [];
+}
+
+/**
+ * Tìm dòng header trong `HEADER_SCAN_ROWS` dòng đầu.
+ * Chấm điểm 2 tầng: (1) số cột anchor khớp, (2) số giá trị non-empty phân biệt.
+ * Tầng 2 cần thiết vì mỗi anchor chỉ có ít cách viết được chấp nhận — file đổi
+ * tên cột một chút là mất anchor. Dòng metadata dùng merged cell nên chỉ còn
+ * 1-2 giá trị phân biệt, còn dòng header thật có hàng chục.
+ */
+export function detectHeaderRow(matrix: RawMatrix): {
+  headerIndex: number;
+  anchorScore: number;
+  needsManualHeader: boolean;
+} {
+  const anchors = [
+    COL_TEN_CANDIDATES,
+    COL_TIEN_CANDIDATES,
+    COL_NGUON_CANDIDATES,
+  ];
+  const limit = Math.min(matrix.length, HEADER_SCAN_ROWS);
+
+  let best = { headerIndex: 0, anchorScore: -1, distinct: -1 };
+  for (let i = 0; i < limit; i++) {
+    const row = matrix[i] || [];
+    const keys = new Set<string>();
+    const values = new Set<string>();
+    for (const cell of row) {
+      if (isEmptyVal(cell)) continue;
+      keys.add(normKey(cell));
+      values.add(String(cell).trim());
+    }
+    const anchorScore = anchors.reduce(
+      (acc, cands) =>
+        acc + (cands.some((c) => keys.has(normKey(c))) ? 1 : 0),
+      0
+    );
+    const distinct = values.size;
+    if (
+      anchorScore > best.anchorScore ||
+      (anchorScore === best.anchorScore && distinct > best.distinct)
+    ) {
+      best = { headerIndex: i, anchorScore, distinct };
+    }
+  }
+
+  return {
+    headerIndex: Math.max(0, best.headerIndex),
+    anchorScore: Math.max(0, best.anchorScore),
+    // Không có anchor nào khớp → không đoán bừa dòng 1 (sẽ ra lỗi "cột hiện có:
+    // BỆNH VIỆN..."). Báo UI bắt người dùng nhập dòng header.
+    needsManualHeader: best.anchorScore <= 0,
+  };
+}
+
+/** Cắt ma trận thô thành bảng, lấy `headerIndex` (0-based) làm dòng header. */
+export function tableFromMatrix(
+  matrix: RawMatrix,
+  headerIndex: number
+): ParsedTable {
+  const headerRow = matrix[headerIndex];
+  if (!headerRow) return { columns: [], rows: [], droppedColumns: [] };
+
+  const colDefs: { index: number; name: string }[] = [];
+  const seen = new Set<string>();
+  const droppedColumns: string[] = [];
+  headerRow.forEach((cell, index) => {
+    if (isEmptyVal(cell)) return;
+    const name = String(cell).trim();
+    const key = normKey(name);
+    if (seen.has(key)) {
+      droppedColumns.push(name);
+      return;
+    }
+    seen.add(key);
+    colDefs.push({ index, name });
+  });
 
   const rows: Record<string, unknown>[] = [];
-  for (let r = 2; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
+  for (let r = headerIndex + 1; r < matrix.length; r++) {
+    const raw = matrix[r] || [];
     const obj: Record<string, unknown> = {};
     let hasAny = false;
-    for (const { col, name } of colNames) {
-      const cell = row.getCell(col);
-      let v: unknown = cell.value;
-      if (v !== null && typeof v === "object") {
-        const o = v as { result?: unknown; text?: unknown };
-        if ("result" in o) v = o.result;
-        else if ("text" in o) v = o.text;
-      }
+    for (const { index, name } of colDefs) {
+      const v = raw[index] ?? null;
       obj[name] = v;
       if (!isEmptyVal(v)) hasAny = true;
     }
     if (hasAny) rows.push(obj);
   }
+
+  return { columns: colDefs.map((c) => c.name), rows, droppedColumns };
+}
+
+/**
+ * Gộp nhiều bảng thành một. Cột được union theo `normKey`, lấy cách viết của
+ * bảng đầu tiên làm canonical và **remap lại key của từng row**.
+ * Bắt buộc remap: nếu file A ghi "Tên Bệnh nhân" và file B ghi "Tên bệnh nhân",
+ * gộp thô sẽ khiến findColumn chọn một tên, rows của file kia trả undefined →
+ * cộng thành 0 mà không báo lỗi gì.
+ */
+export function mergeTables(tables: ParsedTable[]): ParsedTable {
+  const canonical = new Map<string, string>();
+  const columns: string[] = [];
+  for (const t of tables) {
+    for (const col of t.columns) {
+      const key = normKey(col);
+      if (!canonical.has(key)) {
+        canonical.set(key, col);
+        columns.push(col);
+      }
+    }
+  }
+
+  const rows: Record<string, unknown>[] = [];
+  for (const t of tables) {
+    // Map tên cột của bảng này → tên canonical, tính 1 lần cho cả bảng.
+    const remap: { from: string; to: string }[] = t.columns.map((col) => ({
+      from: col,
+      to: canonical.get(normKey(col)) || col,
+    }));
+    for (const row of t.rows) {
+      const out: Record<string, unknown> = {};
+      for (const { from, to } of remap) out[to] = row[from];
+      rows.push(out);
+    }
+  }
+
   return { columns, rows };
 }
 
-export function readCsv(text: string): ParsedTable {
-  const parsed = Papa.parse<Record<string, unknown>>(text, {
-    header: true,
-    skipEmptyLines: true,
-  });
-  return {
-    columns: parsed.meta.fields || [],
-    rows: parsed.data as Record<string, unknown>[],
-  };
-}
 
 // ─── Excel styling helpers ───
 
@@ -392,7 +549,51 @@ export interface PivotOutput {
   filename: string;
 }
 
-/** Parse a file (xlsx/csv) into a table. Throws a user-facing message on bad input. */
+/** Đọc file (xlsx/csv) thành ma trận thô. Throw message hiển thị cho user nếu định dạng sai. */
+export async function readRawFile(
+  fileName: string,
+  read: {
+    text: () => Promise<string>;
+    arrayBuffer: () => Promise<ArrayBuffer>;
+  },
+  onProgress?: (ratio: number) => void
+): Promise<RawMatrix> {
+  const lower = fileName.toLowerCase();
+  const isCsv = lower.endsWith(".csv");
+  const isXlsx = lower.endsWith(".xlsx");
+  if (!isCsv && !isXlsx) {
+    throw new Error("Chỉ hỗ trợ file .xlsx hoặc .csv");
+  }
+  if (isCsv) {
+    const matrix = readRawCsv(await read.text());
+    onProgress?.(1);
+    return matrix;
+  }
+  return readRawXlsx(await read.arrayBuffer(), onProgress);
+}
+
+/**
+ * Chuyển 1-based (số dòng người dùng thấy trong Excel) sang index 0-based,
+ * clamp vào [0, matrix.length-1]. Giá trị rỗng/không hợp lệ → `fallbackIndex`.
+ */
+export function resolveHeaderIndex(
+  matrix: RawMatrix,
+  headerRow1Based: number | null | undefined,
+  fallbackIndex: number
+): number {
+  const maxIndex = Math.max(0, matrix.length - 1);
+  if (
+    headerRow1Based === null ||
+    headerRow1Based === undefined ||
+    !Number.isFinite(headerRow1Based)
+  ) {
+    return Math.min(Math.max(0, fallbackIndex), maxIndex);
+  }
+  const idx = Math.trunc(headerRow1Based) - 1;
+  return Math.min(Math.max(0, idx), maxIndex);
+}
+
+/** Parse một file (xlsx/csv) thành bảng, tự nhận dòng header. */
 export async function parseFile(
   fileName: string,
   read: {
@@ -400,13 +601,20 @@ export async function parseFile(
     arrayBuffer: () => Promise<ArrayBuffer>;
   }
 ): Promise<ParsedTable> {
-  const lower = fileName.toLowerCase();
-  const isCsv = lower.endsWith(".csv");
-  const isXlsx = lower.endsWith(".xlsx");
-  if (!isCsv && !isXlsx) {
-    throw new Error("Chỉ hỗ trợ file .xlsx hoặc .csv");
-  }
-  return isCsv ? readCsv(await read.text()) : readXlsx(await read.arrayBuffer());
+  const matrix = await readRawFile(fileName, read);
+  const { headerIndex } = detectHeaderRow(matrix);
+  return tableFromMatrix(matrix, headerIndex);
+}
+
+/** Các cột bắt buộc theo từng mode, dùng để validate từng file trước khi gộp. */
+export function missingColumns(columns: string[], mode: PivotMode): string[] {
+  const missing: string[] = [];
+  if (!findColumn(columns, COL_TEN_CANDIDATES)) missing.push("Tên Bệnh nhân");
+  if (!findColumn(columns, COL_TIEN_CANDIDATES))
+    missing.push("Tiền sau miễn giảm");
+  if (mode === "source" && !findColumn(columns, COL_NGUON_CANDIDATES))
+    missing.push("Nguồn");
+  return missing;
 }
 
 /** Run the pivot over an already-parsed table. Throws a user-facing message when columns are missing. */

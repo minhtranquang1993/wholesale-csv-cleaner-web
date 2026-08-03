@@ -16,7 +16,7 @@ export default function Home() {
 
   return (
     <main className="flex items-center justify-center min-h-screen p-4">
-      <div className="bg-white rounded-2xl shadow-lg p-8 sm:p-12 max-w-lg w-full">
+      <div className="bg-white rounded-2xl shadow-lg p-8 sm:p-12 max-w-2xl w-full">
         <h1 className="text-2xl font-bold text-gray-900 mb-4">
           📊 Data Cleaner
         </h1>

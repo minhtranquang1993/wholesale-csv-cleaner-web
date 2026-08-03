@@ -1,23 +1,38 @@
 "use client";
 
 import { useState, useCallback, useRef } from "react";
+import ProgressBar from "./ProgressBar";
+import { cleanWholesaleCsv, type CleanPhase, type CleanStats } from "../lib/clean";
 
-interface CleanResult {
-  first_source_url: number;
-  first_user_source: number;
-  first_user_medium: number;
+interface CleanResult extends CleanStats {
+  rowCount: number;
 }
 
 export default function WholesaleTab() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
+  const [phase, setPhase] = useState<CleanPhase | null>(null);
   const [result, setResult] = useState<CleanResult | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Gate bằng ref, không dùng state: onDrop là useCallback deps [] nên đọc
+  // state sẽ luôn thấy giá trị của lần render đầu.
+  const busyRef = useRef(false);
+
+  /** Đổi link tải, tự revoke link cũ để blob file XLSX trước không bị giữ lại. */
+  const setDownload = (url: string | null) => {
+    setDownloadUrl((prev) => {
+      if (prev && prev !== url) URL.revokeObjectURL(prev);
+      return url;
+    });
+  };
 
   const handleFile = (f: File) => {
+    // Đang xử lý thì không cho đổi file: cleanWholesaleCsv đã giữ file cũ nên
+    // đổi tên hiển thị sẽ khiến kết quả không khớp file người dùng thấy.
+    if (busyRef.current) return;
     if (!f.name.toLowerCase().endsWith(".csv")) {
       setError("Chỉ hỗ trợ file .csv");
       return;
@@ -25,7 +40,7 @@ export default function WholesaleTab() {
     setFile(f);
     setError(null);
     setResult(null);
-    setDownloadUrl(null);
+    setDownload(null);
   };
 
   const onDrop = useCallback((e: React.DragEvent) => {
@@ -37,47 +52,38 @@ export default function WholesaleTab() {
   }, []);
 
   const handleSubmit = async () => {
-    if (!file) return;
+    if (!file || busyRef.current) return;
+    busyRef.current = true;
     setLoading(true);
     setError(null);
     setResult(null);
-    setDownloadUrl(null);
+    setDownload(null);
+    setPhase({ percent: 0, label: "Đang bắt đầu..." });
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      // Xử lý ngay trên trình duyệt: không dính giới hạn body 4.5MB của Vercel
+      // và đo được tiến độ thật theo từng phase.
+      const { buffer, stats, rowCount } = await cleanWholesaleCsv(file, setPhase);
 
-      const res = await fetch("/api/clean", {
-        method: "POST",
-        body: formData,
+      setResult({ ...stats, rowCount });
+      const blob = new Blob([buffer], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Lỗi xử lý file");
-      }
-
-      const statsHeader = res.headers.get("X-Clean-Stats");
-      if (statsHeader) {
-        setResult(JSON.parse(statsHeader));
-      }
-
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      setDownloadUrl(url);
+      setDownload(URL.createObjectURL(blob));
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Đã xảy ra lỗi");
     } finally {
+      busyRef.current = false;
       setLoading(false);
+      setPhase(null);
     }
   };
 
   const reset = () => {
     setFile(null);
     setResult(null);
-    setDownloadUrl(null);
+    setDownload(null);
     setError(null);
-    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
   };
 
   return (
@@ -157,6 +163,13 @@ export default function WholesaleTab() {
               if (e.target.files?.[0]) handleFile(e.target.files[0]);
             }}
           />
+          {phase && (
+            <ProgressBar
+              percent={phase.percent}
+              label={phase.label}
+              indeterminate={phase.indeterminate}
+            />
+          )}
           <button
             onClick={handleSubmit}
             disabled={!file || loading}
@@ -188,6 +201,12 @@ export default function WholesaleTab() {
 
           <div className="bg-gray-50 rounded-lg p-4 mb-6 text-left text-sm">
             <div className="flex justify-between py-2">
+              <span className="text-gray-600">Tổng số dòng</span>
+              <span className="font-bold text-gray-900">
+                {result.rowCount.toLocaleString("vi-VN")} dòng
+              </span>
+            </div>
+            <div className="flex justify-between py-2 border-t border-gray-200">
               <span className="text-gray-600">first_source_url cập nhật</span>
               <span className="font-bold text-blue-600">
                 {result.first_source_url} dòng
